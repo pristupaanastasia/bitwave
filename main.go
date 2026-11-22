@@ -8,6 +8,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -35,10 +36,19 @@ func run(args []string) error {
 	bpm := fs.Float64("bpm", 0, "tempo")
 	out := fs.String("o", "", "render to this .wav or .flac file instead of opening the window")
 	seconds := fs.Float64("seconds", 0, "length to render with -o; 0 renders the whole song once (30s for a bare -formula)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
+		return nil // usage was printed
+	} else if err != nil {
 		return err
 	}
 
+	// The window reopens the autosaved song unless told otherwise.
+	songPath := ui.DefaultSongPath()
+	if *load == "" && *formula == "" && *out == "" {
+		if _, err := os.Stat(songPath); err == nil {
+			*load = songPath
+		}
+	}
 	song, err := buildSong(*load, *formula, *mode, *rate, *bpm)
 	if err != nil {
 		return err
@@ -54,21 +64,22 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	game, err := ui.New(eng)
+	game, err := ui.New(eng, songPath)
 	if err != nil {
 		return err
 	}
 	ebiten.SetWindowTitle("bitwave")
 	ebiten.SetWindowSize(ui.Width, ui.Height)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	ebiten.SetScreenClearedEveryFrame(false) // lets Draw skip frames (30 fps cap)
+	ebiten.SetWindowClosingHandled(true)     // autosave before quitting
 	return ebiten.RunGame(game)
 }
 
-// buildSong returns the song to open or render. A -formula without -load
-// starts a fresh one-track bytebeat song (BYTE, 8000 Hz) instead of
-// replacing the demo's kick drum.
+// buildSong returns the song to open or render: an empty song by default,
+// a saved one with -load, or a fresh one-track bytebeat for a bare -formula.
 func buildSong(load, formula, mode string, rate int, bpm float64) (synth.Song, error) {
-	song := synth.DefaultSong()
+	song := synth.EmptySong()
 	switch {
 	case load != "":
 		var err error

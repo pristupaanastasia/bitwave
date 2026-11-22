@@ -3,13 +3,14 @@
 package ui
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image/color"
-	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/pristupaanastasia/bitwave/internal/audiofile"
 	"github.com/pristupaanastasia/bitwave/internal/clipboard"
+	"github.com/pristupaanastasia/bitwave/internal/dialog"
 	"github.com/pristupaanastasia/bitwave/internal/expr"
 	"github.com/pristupaanastasia/bitwave/internal/synth"
 )
@@ -33,11 +35,12 @@ const (
 	charW   = 6
 	seqRows = 25 // two octaves plus the top note
 
-	// SongFile is where SAVE and LOAD keep the project.
+	// SongFile is the default song file name; the app keeps it in the user
+	// config directory (see DefaultSongPath).
 	SongFile = "bitwave-song.json"
-	// legacyFile is the single-track file of earlier versions; LOAD falls
-	// back to it.
-	legacyFile = "bitwave-patch.json"
+
+	autosaveEvery = 2 * time.Second
+	frameInterval = time.Second / 30 // redraw rate; audio is unaffected
 )
 
 var (
@@ -83,7 +86,9 @@ type button struct {
 	r       rect
 	label   func() string
 	onClick func()
-	on      func() bool // highlighted state, optional
+	on      func() bool    // highlighted state, optional
+	meter   func() float64 // level bar 0..1 along the bottom, optional
+	mark    func() bool    // pink underline, e.g. the pattern playing now
 }
 
 // slider is a horizontal control dragged with the mouse. Its value is
@@ -105,9 +110,10 @@ type Game struct {
 	pattern  int // pattern being edited
 	playMode synth.PlayMode
 
-	edit       lineEdit
-	focus      bool
-	formulaErr string
+	edit        lineEdit
+	focus       bool
+	showFormula bool // the formula editor is hidden until asked for
+	formulaErr  string
 
 	status      string
 	statusUntil time.Time
@@ -118,6 +124,7 @@ type Game struct {
 	zoom      int // samples shown across the oscilloscope
 	preset    int
 	lowNote   int // lowest note shown in the sequencer
+	slot      int // selected slot of the song strip, -1 if none
 	exporting bool
 
 	drawing bool
@@ -126,9 +133,24 @@ type Game struct {
 
 	buttons  []button
 	sliders  []slider
-	dragging int // index of the slider being dragged, -1 if none
+	path     vector.Path // reused for the scope and wave traces
+	dragging int         // index of the slider being dragged, -1 if none
 	scopeBuf []float32
 	blink    int
+
+	levels   []float64 // recent peak per track, for the tab meters
+	levelBuf []float32
+	status0  synth.Status // playback status of the current frame
+	newAt    time.Time    // first click of NEW SONG, which needs a second
+
+	songPath     string // where autosave keeps the song
+	askSave      func(prompt, defaultName string) (string, error)
+	askOpen      func(prompt string) (string, error)
+	dialogCh     chan func() // results of file dialogs, run in Update
+	dialogOpen   bool
+	savedJSON    []byte // song as last written, to skip unchanged autosaves
+	lastAutosave time.Time
+	lastDraw     time.Time
 
 	// snap is one copy of the song per frame for labels and drawing, so the
 	// UI does not clone the song under the audio lock dozens of times a frame.
@@ -136,7 +158,19 @@ type Game struct {
 }
 
 // New creates the UI around an engine and starts audio playback.
-func New(eng *synth.Engine) (*Game, error) {
+// DefaultSongPath is where the song is saved and reopened from:
+// ~/Library/Application Support/bitwave/song.json on macOS.
+func DefaultSongPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return SongFile
+	}
+	return filepath.Join(dir, "bitwave", "song.json")
+}
+
+// New creates the UI around an engine, saving the song to songPath, and
+// starts audio playback.
+func New(eng *synth.Engine, songPath string) (*Game, error) {
 	ctx := audio.NewContext(SampleRate)
 	player, err := ctx.NewPlayerF32(eng)
 	if err != nil {
@@ -146,6 +180,8 @@ func New(eng *synth.Engine) (*Game, error) {
 	player.Play()
 	g := newGame(eng)
 	g.player = player
+	g.songPath = songPath
+	g.savedJSON, _ = json.Marshal(eng.Song()) // what is on disk, or nothing new yet
 	return g, nil
 }
 
@@ -158,6 +194,11 @@ func newGame(eng *synth.Engine) *Game {
 		preset:   -1,
 		scopeMix: true,
 		dragging: -1,
+		slot:     -1,
+		songPath: SongFile,
+		askSave:  dialog.Save,
+		askOpen:  dialog.Open,
+		dialogCh: make(chan func(), 1),
 	}
 	g.selectTrack(0)
 	g.layout()
@@ -273,12 +314,50 @@ func (g *Game) appendToSong() {
 	g.eng.EditSong(func(s *synth.Song) { s.Order = append(s.Order, p) })
 }
 
-func (g *Game) removeLastFromSong() {
+// removeFromSong removes the selected slot of the song strip, or the last
+// one when nothing is selected.
+func (g *Game) removeFromSong() {
+	order := g.eng.Song().Order
+	if len(order) <= 1 {
+		g.setStatus("the song needs one slot; right click it to put another pattern there")
+		return
+	}
+	i := g.slot
+	if i < 0 || i >= len(order) {
+		i = len(order) - 1
+	}
+	g.eng.EditSong(func(s *synth.Song) { s.Order = append(s.Order[:i], s.Order[i+1:]...) })
+	g.slot = -1
+}
+
+// deletePattern removes the current pattern, drops its slots from the song
+// and renames the later patterns (C becomes B, ...).
+func (g *Game) deletePattern() {
+	if len(g.eng.Song().Patterns) <= 1 {
+		g.setStatus("the song needs at least one pattern")
+		return
+	}
+	p := g.pattern
 	g.eng.EditSong(func(s *synth.Song) {
-		if len(s.Order) > 1 {
-			s.Order = s.Order[:len(s.Order)-1]
+		s.Patterns = append(s.Patterns[:p], s.Patterns[p+1:]...)
+		var order []int
+		for _, o := range s.Order {
+			switch {
+			case o == p:
+				continue
+			case o > p:
+				o--
+			}
+			order = append(order, o)
 		}
+		if len(order) == 0 {
+			order = []int{0} // the song was only this pattern
+		}
+		s.Order = order
 	})
+	g.slot = -1
+	g.selectPattern(min(p, len(g.eng.Song().Patterns)-1))
+	g.setStatus("deleted pattern " + synth.PatternName(p))
 }
 
 // clickOrder handles the arrangement strip: left click jumps there and edits
@@ -297,6 +376,7 @@ func (g *Game) clickOrder(mx, my int, right bool) {
 		g.eng.EditSong(func(s *synth.Song) { s.Order[slot] = p })
 		return
 	}
+	g.slot = slot
 	g.selectPattern(order[slot])
 	g.eng.Seek(slot)
 }
@@ -343,6 +423,51 @@ func (g *Game) loadPreset(i int) {
 }
 
 // loadInstrument replaces the selected track's sound with a template.
+// level is the recent peak of track i (0..1), refreshed every frame.
+func (g *Game) level(i int) float64 {
+	if i < len(g.levels) {
+		return g.levels[i]
+	}
+	return 0
+}
+
+// updateLevels measures each track's peak over the last ~20 ms.
+func (g *Game) updateLevels(n int) {
+	if len(g.levelBuf) == 0 {
+		g.levelBuf = make([]float32, 1024)
+	}
+	g.levels = g.levels[:0]
+	for i := range n {
+		g.eng.Scope(g.levelBuf, i)
+		peak := 0.0
+		for _, v := range g.levelBuf {
+			peak = max(peak, math.Abs(float64(v)))
+		}
+		g.levels = append(g.levels, peak)
+	}
+}
+
+func (g *Game) confirmNew() bool { return time.Since(g.newAt) < 3*time.Second }
+
+// newSong replaces everything with an empty one-track song. It needs two
+// clicks within 3 seconds, so a stray click does not erase the work.
+func (g *Game) newSong() {
+	if !g.confirmNew() {
+		g.newAt = time.Now()
+		g.setStatus("click CLEAR ALL? again to start an empty song (unsaved changes are lost)")
+		return
+	}
+	g.newAt = time.Time{}
+	if err := g.eng.Load(synth.EmptySong()); err != nil {
+		g.setStatus("new song failed: " + err.Error())
+		return
+	}
+	g.slot = -1
+	g.selectTrack(0)
+	g.selectPattern(0)
+	g.setStatus("empty song: click the grid to add notes, + TRACK for more instruments")
+}
+
 func (g *Game) loadInstrument(i int) {
 	n := len(synth.Instruments)
 	in := synth.Instruments[(i%n+n)%n]
@@ -365,52 +490,120 @@ func (g *Game) setStatus(s string) {
 	g.status, g.statusUntil = s, time.Now().Add(5*time.Second)
 }
 
-// export renders the whole arrangement to a file in the background, so the
-// UI and live audio keep running.
+// export asks where to save, then renders the whole arrangement in the
+// background, so the UI and live audio keep running.
 func (g *Game) export(format string) {
 	if g.exporting {
 		return
 	}
-	g.exporting = true
 	song := g.eng.Song()
-	g.setStatus("rendering song...")
-	go func() {
-		g.statusCh <- exportSong(song, format, time.Now())
-	}()
+	suggested := "bitwave-" + time.Now().Format("20060102-150405") + "." + format
+	g.ask(func() (string, error) { return g.askSave("Export the song as "+strings.ToUpper(format), suggested) },
+		func(path string) {
+			if f := audiofile.FormatOf(path); f != "wav" && f != "flac" {
+				path += "." + format
+			}
+			g.exporting = true
+			g.setStatus("rendering song...")
+			go func() { g.statusCh <- exportSong(song, path) }()
+		})
 }
 
-func exportSong(song synth.Song, format string, now time.Time) string {
+func exportSong(song synth.Song, path string) string {
 	e, err := synth.New(SampleRate, song)
 	if err != nil {
 		return "export failed: " + err.Error()
 	}
-	name := "bitwave-" + now.Format("20060102-150405") + "." + format
 	samples := e.RenderSong()
-	if err := audiofile.WriteFile(name, SampleRate, samples); err != nil {
+	if err := audiofile.WriteFile(path, SampleRate, samples); err != nil {
 		return "export failed: " + err.Error()
 	}
-	return fmt.Sprintf("saved %.1fs song to %s", float64(len(samples))/SampleRate, name)
+	return fmt.Sprintf("saved %.1fs song to %s", float64(len(samples))/SampleRate, path)
 }
 
-func (g *Game) save() {
-	b, err := json.MarshalIndent(g.eng.Song(), "", "  ")
-	if err == nil {
-		err = os.WriteFile(SongFile, b, 0o644)
-	}
-	if err != nil {
-		g.setStatus("save failed: " + err.Error())
+// ask runs a blocking file dialog off the UI thread; then runs on the UI
+// thread (from Update) with the chosen path. Cancel does nothing.
+func (g *Game) ask(dlg func() (string, error), then func(path string)) {
+	if g.dialogOpen {
 		return
 	}
-	g.setStatus("saved " + SongFile)
+	g.dialogOpen = true
+	go func() {
+		path, err := dlg()
+		g.dialogCh <- func() {
+			g.dialogOpen = false
+			switch {
+			case errors.Is(err, dialog.ErrCanceled):
+			case err != nil:
+				g.setStatus("file dialog failed: " + err.Error())
+			default:
+				then(path)
+			}
+		}
+	}()
 }
 
-func (g *Game) load() {
-	name := SongFile
-	s, err := LoadSong(name)
-	if errors.Is(err, fs.ErrNotExist) {
-		name = legacyFile
-		s, err = LoadSong(name)
+// save asks for a file name and writes the song there ("Save as").
+func (g *Game) save() {
+	g.ask(func() (string, error) { return g.askSave("Save the song as", "my song.json") },
+		func(path string) {
+			if !strings.EqualFold(filepath.Ext(path), ".json") {
+				path += ".json"
+			}
+			if err := g.writeSongTo(path); err != nil {
+				g.setStatus("save failed: " + err.Error())
+				return
+			}
+			g.setStatus("saved " + path)
+		})
+}
+
+// writeSongTo writes the song atomically (temp file + rename), so a crash
+// mid-write never leaves a broken file.
+func (g *Game) writeSongTo(path string) error {
+	b, err := json.MarshalIndent(g.eng.Song(), "", "  ")
+	if err != nil {
+		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if path == g.songPath {
+		g.savedJSON, _ = json.Marshal(g.eng.Song())
+	}
+	return nil
+}
+
+// autosave writes the song to songPath when it changed, at most every
+// autosaveEvery (or right away with force, e.g. when the window closes).
+func (g *Game) autosave(now time.Time, force bool) {
+	if !force && now.Sub(g.lastAutosave) < autosaveEvery {
+		return
+	}
+	g.lastAutosave = now
+	cur, err := json.Marshal(g.eng.Song())
+	if err != nil || bytes.Equal(cur, g.savedJSON) {
+		return
+	}
+	if err := g.writeSongTo(g.songPath); err != nil {
+		g.setStatus("autosave failed: " + err.Error())
+	}
+}
+
+// load asks for a song file and opens it.
+func (g *Game) load() {
+	g.ask(func() (string, error) { return g.askOpen("Open a song") }, g.loadFrom)
+}
+
+func (g *Game) loadFrom(path string) {
+	s, err := LoadSong(path)
 	if err == nil {
 		err = g.eng.Load(s)
 	}
@@ -418,9 +611,10 @@ func (g *Game) load() {
 		g.setStatus("load failed: " + err.Error())
 		return
 	}
+	g.slot = -1
 	g.selectTrack(0)
 	g.selectPattern(0)
-	g.setStatus("loaded " + name)
+	g.setStatus("loaded " + path)
 }
 
 // LoadSong reads a project saved with SAVE (or a single-track patch from
@@ -472,6 +666,13 @@ func (g *Game) layout() {
 	add(y, text("-"), 20, func() { g.eng.EditSong(func(s *synth.Song) { s.Volume -= 0.1 }) })
 	add(y, func() string { return fmt.Sprintf("MASTER %.0f%%", g.snap.Volume*100) }, 90, nil)
 	add(y, text("+"), 20, func() { g.eng.EditSong(func(s *synth.Song) { s.Volume += 0.1 }) })
+	x += 8
+	add(y, func() string {
+		if g.confirmNew() {
+			return "CLEAR ALL?"
+		}
+		return "NEW SONG"
+	}, 80, g.newSong)
 	x = Width - 10 - 4*94 + 4
 	add(y, text("EXPORT WAV"), 90, func() { g.export("wav") })
 	add(y, text("EXPORT FLAC"), 90, func() { g.export("flac") })
@@ -488,6 +689,7 @@ func (g *Game) layout() {
 		}
 		b := add(y, text(label), tabW-48, func() { g.selectTrack(i) })
 		b.on = func() bool { return g.track == i }
+		b.meter = func() float64 { return g.level(i) }
 		x -= 4
 		m := add(y, text("M"), 20, func() {
 			g.eng.EditSong(func(s *synth.Song) { s.Tracks[i].Mute = !s.Tracks[i].Mute })
@@ -503,45 +705,58 @@ func (g *Game) layout() {
 	add(y, text("+ TRACK"), 0, g.addTrack)
 	add(y, text("- TRACK"), 0, g.removeTrack)
 
-	// Selected track settings.
+	// Selected track settings: the instrument and volume always; the
+	// formula-level controls only after SHOW FORMULA.
 	x = 10
 	y = rowTrackCtl
 	add(y, func() string { return fmt.Sprintf("TRACK %d", g.track+1) }, 60, nil)
-	add(y, func() string { return "MODE " + g.snapTrack().Mode.String() }, 80, func() {
-		g.editTrack(func(t *synth.Track) {
-			if t.Mode == synth.ModeByte {
-				t.Mode = synth.ModeFloat
-			} else {
-				t.Mode = synth.ModeByte
-			}
-		})
-	})
-	x += 8
-	add(y, text("-"), 20, func() { g.editTrack(func(t *synth.Track) { t.Rate = stepRate(t.Rate, -1) }) })
-	add(y, func() string { return fmt.Sprintf("RATE %d", g.snapTrack().Rate) }, 82, nil)
-	add(y, text("+"), 20, func() { g.editTrack(func(t *synth.Track) { t.Rate = stepRate(t.Rate, 1) }) })
-	x += 8
-	add(y, text("-"), 20, func() { g.editTrack(func(t *synth.Track) { t.Volume -= 0.05 }) })
-	add(y, func() string { return fmt.Sprintf("VOL %.0f%%", g.snapTrack().Volume*100) }, 66, nil)
-	add(y, text("+"), 20, func() { g.editTrack(func(t *synth.Track) { t.Volume += 0.05 }) })
-	x += 8
-	add(y, text("<"), 20, func() { g.loadPreset(g.preset - 1) })
-	add(y, func() string {
-		if g.preset < 0 {
-			return "FORMULA PRESET"
-		}
-		return synth.Presets[g.preset].Name
-	}, 130, nil)
-	add(y, text(">"), 20, func() { g.loadPreset(g.preset + 1) })
-	x += 8
 	add(y, text("<"), 20, func() { g.loadInstrument(synth.InstrumentIndex(g.snapTrack().Instrument) - 1) })
 	add(y, func() string {
 		if in := g.snapTrack().Instrument; in != "" {
 			return "INSTRUMENT " + in
 		}
-		return "INSTRUMENT"
-	}, 130, nil)
+		return "INSTRUMENT custom"
+	}, 140, nil)
 	add(y, text(">"), 20, func() { g.loadInstrument(synth.InstrumentIndex(g.snapTrack().Instrument) + 1) })
+	x += 8
+	add(y, text("-"), 20, func() { g.editTrack(func(t *synth.Track) { t.Volume -= 0.05 }) })
+	add(y, func() string { return fmt.Sprintf("VOL %.0f%%", g.snapTrack().Volume*100) }, 66, nil)
+	add(y, text("+"), 20, func() { g.editTrack(func(t *synth.Track) { t.Volume += 0.05 }) })
+	x += 8
+	add(y, func() string {
+		if g.showFormula {
+			return "HIDE FORMULA"
+		}
+		return "SHOW FORMULA"
+	}, 90, func() {
+		g.showFormula = !g.showFormula
+		g.focus = false
+	})
+	if g.showFormula {
+		x += 8
+		add(y, func() string { return "MODE " + g.snapTrack().Mode.String() }, 80, func() {
+			g.editTrack(func(t *synth.Track) {
+				if t.Mode == synth.ModeByte {
+					t.Mode = synth.ModeFloat
+				} else {
+					t.Mode = synth.ModeByte
+				}
+			})
+		})
+		x += 4
+		add(y, text("-"), 20, func() { g.editTrack(func(t *synth.Track) { t.Rate = stepRate(t.Rate, -1) }) })
+		add(y, func() string { return fmt.Sprintf("RATE %d", g.snapTrack().Rate) }, 82, nil)
+		add(y, text("+"), 20, func() { g.editTrack(func(t *synth.Track) { t.Rate = stepRate(t.Rate, 1) }) })
+		x += 8
+		add(y, text("<"), 20, func() { g.loadPreset(g.preset - 1) })
+		add(y, func() string {
+			if g.preset < 0 {
+				return "FORMULA PRESET"
+			}
+			return synth.Presets[g.preset].Name
+		}, 130, nil)
+		add(y, text(">"), 20, func() { g.loadPreset(g.preset + 1) })
+	}
 
 	g.layoutSound()
 
@@ -576,12 +791,14 @@ func (g *Game) layout() {
 	for i := range s.Patterns {
 		b := add(y, text(synth.PatternName(i)), 22, func() { g.selectPattern(i) })
 		b.on = func() bool { return g.pattern == i }
+		b.mark = func() bool { return g.playing() && g.status0.Pattern == i }
 	}
 	add(y, text("NEW"), 0, func() { g.newPattern(false) })
 	add(y, text("COPY"), 0, func() { g.newPattern(true) })
+	add(y, text("DELETE"), 0, g.deletePattern)
 	x = Width - 10 - 2*94 + 4
 	add(y, text("+ TO SONG"), 90, g.appendToSong)
-	add(y, text("- FROM SONG"), 90, g.removeLastFromSong)
+	add(y, text("- FROM SONG"), 90, g.removeFromSong)
 
 	// Sequencer.
 	x = seqR.x
@@ -714,7 +931,7 @@ func (g *Game) click(mx, my int, right bool) {
 		g.clickOrder(mx, my, true)
 		return
 	}
-	g.focus = formulaR.contains(mx, my)
+	g.focus = g.showFormula && formulaR.contains(mx, my)
 	if i := g.sliderAt(mx, my); i >= 0 {
 		g.dragging = i
 		g.dragSlider(i, mx)
@@ -732,11 +949,18 @@ func (g *Game) click(mx, my int, right bool) {
 
 // Update handles input. It runs at 60 TPS.
 func (g *Game) Update() error {
+	if ebiten.IsWindowBeingClosed() {
+		g.autosave(time.Now(), true)
+		return ebiten.Termination
+	}
+	g.autosave(time.Now(), false)
 	g.blink++
 	select {
 	case s := <-g.statusCh:
 		g.exporting = false
 		g.setStatus(s)
+	case fn := <-g.dialogCh:
+		fn()
 	default:
 	}
 	mx, my := ebiten.CursorPosition()
@@ -849,11 +1073,20 @@ func (g *Game) updateTyping() {
 func (g *Game) Layout(int, int) (int, int) { return Width, Height }
 
 // Draw renders the whole window.
+// The screen is not cleared between frames (see main), so skipping a frame
+// keeps the previous picture: this caps redraws at 30 per second.
 func (g *Game) Draw(dst *ebiten.Image) {
+	if now := time.Now(); now.Sub(g.lastDraw) < frameInterval {
+		return
+	} else {
+		g.lastDraw = now
+	}
 	dst.Fill(colBG)
 	g.snap = g.eng.Song()
 	song := g.snap
 	st := g.eng.Status()
+	g.status0 = st
+	g.updateLevels(len(song.Tracks))
 	mx, my := ebiten.CursorPosition()
 	for _, b := range g.buttons {
 		label := b.label()
@@ -869,6 +1102,14 @@ func (g *Game) Draw(dst *ebiten.Image) {
 			}
 			fill(dst, b.r, c)
 		}
+		if b.meter != nil {
+			if lv := b.meter(); lv > 0.01 {
+				vector.FillRect(dst, float32(b.r.x), float32(b.r.y+b.r.h-3), float32(lv)*float32(b.r.w), 3, colScope, false)
+			}
+		}
+		if b.mark != nil && b.mark() {
+			vector.FillRect(dst, float32(b.r.x), float32(b.r.y+b.r.h-3), float32(b.r.w), 3, colPlay, false)
+		}
 		ebitenutil.DebugPrintAt(dst, label, b.r.x+(b.r.w-len(label)*charW)/2, b.r.y+3)
 	}
 	g.drawSliders(dst)
@@ -878,9 +1119,14 @@ func (g *Game) Draw(dst *ebiten.Image) {
 	g.drawOrder(dst, song, st)
 	g.drawSequencer(dst, song, st)
 
-	help := "vars: t time  p note phase  f Hz  g gate  e envelope  n ticks since note  s step  r rate  k1..k4 knobs  w(x) drawn wave\n" +
-		"ops: + - * / % ** & | ^ ~ << >> >>> < > == != && || !  a?b:c  [a,b,c][i]  sin cos tanh abs floor min max pow exp random ...\n" +
-		"SPACE play/stop  INSTRUMENT < > picks a sound, drag the knobs  k1..k4 and ADSR (e)  click formula to edit  SONG: click = jump, right click = put"
+	help := "SPACE play/stop   pick a track tab, then INSTRUMENT < > for its sound   drag the knobs and A D S R GATE to shape it\n" +
+		"click the grid to place notes   PATTERN A B ... switch, DELETE removes one   SONG: click = select & jump, right click = put pattern, - FROM SONG removes the selected\n" +
+		"draw in the orange panel to change the wave (bass, pluck)   M mute  S solo   EXPORT saves the whole song"
+	if g.showFormula {
+		help = "vars: t time  p note phase  f Hz  g gate  e envelope  n ticks since note  s step  r rate  k1..k4 knobs  w(x) drawn wave\n" +
+			"ops: + - * / % ** & | ^ ~ << >> >>> < > == != && || !  a?b:c  [a,b,c][i]  sin cos tanh abs floor min max pow exp random ...\n" +
+			"click the formula to edit (Cmd/Ctrl+V paste), every valid change is heard at once   HIDE FORMULA to go back"
+	}
 	ebitenutil.DebugPrintAt(dst, help, 10, Height-50)
 }
 
@@ -902,6 +1148,11 @@ func (g *Game) drawSliders(dst *ebiten.Image) {
 }
 
 func (g *Game) drawFormula(dst *ebiten.Image, st synth.Status) {
+	if !g.showFormula {
+		// Without the editor, the row only shows playback status.
+		g.drawStatus(dst, st, formulaR.y+4)
+		return
+	}
 	fill(dst, formulaR, colPanel2)
 	if g.focus {
 		vector.StrokeRect(dst, float32(formulaR.x), float32(formulaR.y), float32(formulaR.w), float32(formulaR.h), 1, colFocus, false)
@@ -915,9 +1166,14 @@ func (g *Game) drawFormula(dst *ebiten.Image, st synth.Status) {
 		vector.StrokeLine(dst, cx, float32(formulaR.y+4), cx, float32(formulaR.y+20), 1, colScope, false)
 	}
 
-	y := formulaR.y + formulaR.h + 4
+	g.drawStatus(dst, st, formulaR.y+formulaR.h+4)
+}
+
+// drawStatus shows a formula error, a recent status message, or the
+// playback position.
+func (g *Game) drawStatus(dst *ebiten.Image, st synth.Status, y int) {
 	switch {
-	case g.formulaErr != "":
+	case g.showFormula && g.formulaErr != "":
 		msg := "error " + g.formulaErr + " (still playing the last valid formula)"
 		fill(dst, rect{formulaR.x, y, len(msg)*charW + 12, 22}, colError)
 		ebitenutil.DebugPrintAt(dst, msg, formulaR.x+6, y+3)
@@ -975,18 +1231,26 @@ func (g *Game) drawScope(dst *ebiten.Image) {
 		x := float32(r.x + i*r.w/8)
 		vector.StrokeLine(dst, x, float32(r.y), x, float32(r.y+r.h), 1, colGrid, false)
 	}
+	// One path for the whole trace: a vertical min-max bar per pixel
+	// column joined by the column midpoints. Drawing it in one call instead
+	// of a line per column keeps the CPU (and the laptop) cool.
 	lo, hi := columns(win, r.w)
 	sy := func(v float32) float32 { return mid - v*float32(r.h)/2*0.95 }
-	var prev float32
+	g.path.Reset()
 	for x := range r.w {
 		fx := float32(r.x + x)
-		vector.StrokeLine(dst, fx, sy(lo[x]), fx, sy(hi[x])+1, 1, colScope, false)
-		c := (lo[x] + hi[x]) / 2
-		if x > 0 {
-			vector.StrokeLine(dst, fx-1, sy(prev), fx, sy(c), 1, colScope, true)
-		}
-		prev = c
+		g.path.MoveTo(fx, sy(lo[x]))
+		g.path.LineTo(fx, sy(hi[x])+1)
 	}
+	for x := range r.w {
+		fx, c := float32(r.x+x), sy((lo[x]+hi[x])/2)
+		if x == 0 {
+			g.path.MoveTo(fx, c)
+		} else {
+			g.path.LineTo(fx, c)
+		}
+	}
+	strokePath(dst, &g.path, 1, colScope)
 	what := "mix"
 	if src != synth.ScopeMix {
 		what = fmt.Sprintf("track %d", g.track+1)
@@ -1002,9 +1266,12 @@ func (g *Game) drawWave(dst *ebiten.Image, song synth.Song, st synth.Status) {
 	w := song.Tracks[g.track].Wave
 	px := func(i int) float32 { return float32(r.x) + float32(i)*float32(r.w)/expr.WaveSize }
 	py := func(v float64) float32 { return float32(r.y) + float32(r.h)*float32(1-v/255) }
+	g.path.Reset()
+	g.path.MoveTo(px(0), py(w[0]))
 	for i := 1; i < expr.WaveSize; i++ {
-		vector.StrokeLine(dst, px(i-1), py(w[i-1]), px(i), py(w[i]), 2, colWave, true)
+		g.path.LineTo(px(i), py(w[i]))
 	}
+	strokePath(dst, &g.path, 2, colWave)
 	if g.playing() && g.track < len(st.Phase) {
 		x := px(int(st.Phase[g.track]))
 		vector.StrokeLine(dst, x, float32(r.y), x, float32(r.y+r.h), 1, colPlay, false)
@@ -1026,6 +1293,9 @@ func (g *Game) drawOrder(dst *ebiten.Image, song synth.Song, st synth.Status) {
 			c = colBtnOn
 		}
 		fill(dst, cell, c)
+		if i == g.slot { // selected: "- FROM SONG" removes this one
+			vector.StrokeRect(dst, float32(cell.x), float32(cell.y), float32(cell.w), float32(cell.h), 2, colWave, false)
+		}
 		ebitenutil.DebugPrintAt(dst, synth.PatternName(p), cell.x+5, cell.y+3)
 	}
 	secs := float64(len(song.Order)*synth.Steps) * 60 / song.BPM / 4
@@ -1084,6 +1354,12 @@ func (g *Game) drawSequencer(dst *ebiten.Image, song synth.Song, st synth.Status
 		}
 		vector.FillRect(dst, x+2, float32(r.y)+float32(row)*rowH+1, colW-4, rowH-2, colNote, false)
 	}
+}
+
+func strokePath(dst *ebiten.Image, p *vector.Path, width float32, c color.Color) {
+	op := &vector.DrawPathOptions{AntiAlias: true}
+	op.ColorScale.ScaleWithColor(c)
+	vector.StrokePath(dst, p, &vector.StrokeOptions{Width: width, LineJoin: vector.LineJoinRound}, op)
 }
 
 func fill(dst *ebiten.Image, r rect, c color.Color) {
