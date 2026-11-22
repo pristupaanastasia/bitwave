@@ -1,0 +1,8 @@
+# build output
+/bitwave
+
+# exported audio and saved patches
+*.wav
+*.flac
+bitwave-patch.json
+bitwave-song.json

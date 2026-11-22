@@ -1,0 +1,19 @@
+#!/bin/sh
+# pre-push: refuse pushes to master/main and require test coverage >= 70%.
+# Installed with: scripts/install-hooks.sh
+set -eu
+
+protected="master main"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+	branch="${remote_ref#refs/heads/}"
+	for p in $protected; do
+		if [ "$branch" = "$p" ]; then
+			echo "pre-push: pushing to '$p' is not allowed; push a feature branch and open a pull request." >&2
+			exit 1
+		fi
+	done
+done
+
+echo "pre-push: checking test coverage..." >&2
+exec "$(git rev-parse --show-toplevel)/scripts/coverage.sh"

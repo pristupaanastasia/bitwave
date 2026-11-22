@@ -1,0 +1,19 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches-ignore: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Ebitengine system libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgl1-mesa-dev xorg-dev
+      - run: go vet ./...
+      - name: Tests with coverage >= 70%
+        run: scripts/coverage.sh
