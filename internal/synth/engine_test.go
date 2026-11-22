@@ -212,8 +212,8 @@ func TestEditSongAddRemoveTracks(t *testing.T) {
 	e.Render(100) // voices must match tracks, no panic
 
 	e.EditSong(func(s *Song) { s.Tracks[0].Formula = "t>>" })
-	if f := e.Song().Tracks[0].Formula; f != "128" {
-		t.Fatalf("invalid formula should be replaced by silence, got %q", f)
+	if tr := e.Song().Tracks[0]; tr.Formula != silence(tr.Mode) {
+		t.Fatalf("invalid formula should be replaced by silence, got %q", tr.Formula)
 	}
 	if len(e.Status().T) != 4 {
 		t.Fatal("status per track")

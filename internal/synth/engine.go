@@ -64,12 +64,48 @@ type voice struct {
 	acc  int   // resampling accumulator
 	note int
 	cur  float32 // current sample, held between formula ticks
+
+	// ADSR state, in output samples.
+	held     int // note sounding (through the release)
+	onAt     int64
+	gateLen  int64
+	startLvl float64
+	lvl      float64
+	playing  bool
 }
 
 func (v *voice) reset(outRate int) {
-	v.tick, v.age, v.acc, v.note = 0, 0, outRate, Rest
-	v.env.P = 0
+	*v = voice{id: v.id, src: v.src, prog: v.prog, env: expr.Env{Wave: v.env.Wave}}
+	v.acc, v.note, v.held = outRate, Rest, Rest
 	v.env.Seed(1)
+}
+
+// trigger starts the note of a new step for this voice.
+func (v *voice) trigger(note int, t *Track, clock int64, samplesPerStep float64) {
+	v.note = note
+	if note == Rest {
+		return
+	}
+	v.env.P, v.age = 0, 0 // retrigger the oscillator and n
+	if t.Env.On {
+		// Start the attack from the current level so retriggers do not click.
+		v.held, v.onAt, v.startLvl, v.playing = note, clock, v.lvl, true
+		v.gateLen = int64(t.Env.Gate * samplesPerStep)
+	}
+}
+
+// updateEnvelope advances the ADSR to the given output sample.
+func (v *voice) updateEnvelope(t *Track, clock int64, outRate int) {
+	if !t.Env.On || !v.playing {
+		v.lvl = 0
+		return
+	}
+	sec := func(n int64) float64 { return float64(n) / float64(outRate) }
+	lvl, done := t.Env.level(v.startLvl, sec(clock-v.onAt), sec(v.gateLen))
+	v.lvl = lvl
+	if done {
+		v.playing, v.held = false, Rest
+	}
 }
 
 // Engine generates audio. All methods are safe for concurrent use: the
@@ -207,10 +243,10 @@ func (e *Engine) EditSong(fn func(s *Song)) {
 		if !ok {
 			// A new track: align its t with the song clock and let it join
 			// the note of the current step instead of waiting for the next.
-			v.reset(e.outRate)
 			v.id = t.ID
+			v.reset(e.outRate)
 			v.tick = e.clock * int64(t.Rate) / int64(e.outRate)
-			v.note = pat.Notes[i][abs%Steps]
+			v.trigger(pat.Notes[i][abs%Steps], t, e.clock, e.samplesPerStep())
 		}
 		if v.prog == nil || v.src != t.Formula {
 			prog, err := expr.Compile(t.Formula)
@@ -375,12 +411,9 @@ func (e *Engine) nextLocked() float32 {
 	pat := &s.Patterns[e.patternAt(abs)]
 	if abs != e.lastAbs {
 		e.lastAbs = abs
+		sps := e.samplesPerStep()
 		for i := range e.voices {
-			v := &e.voices[i]
-			v.note = pat.Notes[i][step]
-			if v.note != Rest {
-				v.env.P, v.age = 0, 0 // retrigger
-			}
+			e.voices[i].trigger(pat.Notes[i][step], &s.Tracks[i], e.clock, sps)
 		}
 	}
 	envelope := 1 - (e.stepPos - float64(abs))
@@ -392,6 +425,7 @@ func (e *Engine) nextLocked() float32 {
 	var mix float32
 	for i := range e.voices {
 		v, t := &e.voices[i], &s.Tracks[i]
+		v.updateEnvelope(t, e.clock, e.outRate)
 		for v.acc >= e.outRate {
 			v.acc -= e.outRate
 			v.cur = v.tickLocked(t, step, envelope)
@@ -419,9 +453,13 @@ func (v *voice) tickLocked(t *Track, step int, envelope float64) float32 {
 	env := &v.env
 	env.T, env.S, env.R, env.N = float64(v.tick), float64(step), rate, float64(v.age)
 	env.Wave = &t.Wave
-	if v.note == Rest {
+	env.K = t.Knobs
+	switch {
+	case t.Env.On && v.playing:
+		env.F, env.G, env.E = NoteHz(v.held), 1, v.lvl
+	case t.Env.On, v.note == Rest:
 		env.F, env.G, env.E = 0, 0, 0
-	} else {
+	default:
 		env.F, env.G, env.E = NoteHz(v.note), 1, envelope
 	}
 
