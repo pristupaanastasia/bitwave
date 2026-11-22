@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -40,105 +41,157 @@ func signals() map[string][]int16 {
 	return out
 }
 
-func TestFLACRoundTrip(t *testing.T) {
-	for name, in := range signals() {
-		var b bytes.Buffer
-		if err := EncodeFLAC(&b, 44100, in); err != nil {
-			t.Fatal(err)
-		}
-		got, rate, err := decodeFLAC(b.Bytes())
-		if err != nil {
-			t.Fatalf("%s: decode: %v", name, err)
-		}
-		if rate != 44100 || len(got) != len(in) {
-			t.Fatalf("%s: rate %d len %d, want 44100 %d", name, rate, len(got), len(in))
-		}
-		// First frame header: block size code 4096, explicit 44.1 kHz rate code.
-		if len(in) >= flacBlockSize && b.Bytes()[44] != 0xC9 {
-			t.Fatalf("%s: frame header byte %#x", name, b.Bytes()[44])
-		}
-		for i := range in {
-			if got[i] != in[i] {
-				t.Fatalf("%s: sample %d = %d, want %d", name, i, got[i], in[i])
-			}
-		}
-		t.Logf("%-9s %6d bytes (wav would be %d)", name, b.Len(), 44+2*len(in))
+func TestFLAC(t *testing.T) {
+	type testCase struct {
+		name  string
+		check func(t *testing.T)
 	}
-}
+	var tests []testCase
 
-// TestFLACCompressesBytebeat uses a signal shaped like real engine output:
-// an 8 kHz bytebeat held to 44.1 kHz at 60% volume.
-// TestFLACRates covers every way a sample rate is written in frame headers.
-func TestFLACRates(t *testing.T) {
-	in := signals()["sine"]
+	for _, name := range []string{"silence", "sine", "bytebeat", "noise", "extremes", "tiny", "short"} {
+		tests = append(tests, testCase{"round trip/" + name, func(t *testing.T) {
+			in := signals()[name]
+			var b bytes.Buffer
+			if err := EncodeFLAC(&b, 44100, in); err != nil {
+				t.Fatal(err)
+			}
+			got, rate, err := decodeFLAC(b.Bytes())
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if rate != 44100 || len(got) != len(in) {
+				t.Fatalf("rate %d len %d, want 44100 %d", rate, len(got), len(in))
+			}
+			// First frame header: block size code 4096, explicit 44.1 kHz rate code.
+			if len(in) >= flacBlockSize && b.Bytes()[44] != 0xC9 {
+				t.Fatalf("frame header byte %#x", b.Bytes()[44])
+			}
+			for i := range in {
+				if got[i] != in[i] {
+					t.Fatalf("sample %d = %d, want %d", i, got[i], in[i])
+				}
+			}
+			t.Logf("%d bytes (wav would be %d)", b.Len(), 44+2*len(in))
+		}})
+	}
+
+	// Every way a sample rate is written in frame headers: table code,
+	// kHz byte, Hz word, tens-of-Hz word, STREAMINFO only.
 	for _, rate := range []int{8000, 44100, 12000, 11025, 100000, 655350, 655351} {
-		var b bytes.Buffer
-		if err := EncodeFLAC(&b, rate, in); err != nil {
-			t.Fatal(err)
-		}
-		got, r, err := decodeFLAC(b.Bytes())
-		if err != nil || r != rate || len(got) != len(in) {
-			t.Fatalf("rate %d: got %d, len %d, err %v", rate, r, len(got), err)
-		}
-	}
-	if err := EncodeFLAC(&bytes.Buffer{}, 0, in); err == nil {
-		t.Fatal("want error for rate 0")
-	}
-}
-
-func TestFLACCompressesBytebeat(t *testing.T) {
-	for _, formula := range []func(t int) int{
-		func(t int) int { return t & (t >> 8) },
-		func(t int) int { return t * (42 & (t >> 10)) },
-	} {
-		in := make([]int16, 44100*10)
-		for i := range in {
-			v := formula(i*8000/44100) & 255
-			in[i] = int16(float64(v-128) / 128 * 0.6 * 32767)
-		}
-		var b bytes.Buffer
-		EncodeFLAC(&b, 44100, in)
-		ratio := float64(2*len(in)) / float64(b.Len())
-		t.Logf("compression %.1fx", ratio)
-		// Sample-and-hold steps leave sparse large residuals, which Rice coding
-		// handles only moderately well; ~1.6-2x is the honest result here.
-		if ratio < 1.4 {
-			t.Errorf("compression only %.1fx", ratio)
-		}
-	}
-}
-
-// TestFLACWithSystemDecoder cross-checks against Apple's decoder when present.
-func TestFLACWithSystemDecoder(t *testing.T) {
-	if _, err := exec.LookPath("afconvert"); err != nil {
-		t.Skip("afconvert not available")
-	}
-	dir := t.TempDir()
-	if !systemFLACWorks(t, dir) {
-		t.Skip("afconvert cannot round-trip its own FLAC output on this machine; " +
-			"the system decoder is unusable as a reference here")
-	}
-	for _, name := range []string{"sine", "bytebeat", "noise", "silence"} {
-		in := signals()[name]
-		src := filepath.Join(dir, name+".flac")
-		dst := filepath.Join(dir, name+".wav")
-		f, _ := os.Create(src)
-		EncodeFLAC(f, 44100, in)
-		f.Close()
-		out, err := exec.Command("afconvert", "-f", "WAVE", "-d", "LEI16", src, dst).CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s: afconvert: %v %s", name, err, out)
-		}
-		data, _ := os.ReadFile(dst)
-		pcm := wavData(t, data)
-		if len(pcm) != 2*len(in) {
-			t.Fatalf("%s: decoded %d bytes, want %d", name, len(pcm), 2*len(in))
-		}
-		for j := range in {
-			if v := int16(binary.LittleEndian.Uint16(pcm[2*j:])); v != in[j] {
-				t.Fatalf("%s: sample %d = %d, want %d", name, j, v, in[j])
+		tests = append(tests, testCase{fmt.Sprintf("rate/%d", rate), func(t *testing.T) {
+			in := signals()["sine"]
+			var b bytes.Buffer
+			if err := EncodeFLAC(&b, rate, in); err != nil {
+				t.Fatal(err)
 			}
+			got, r, err := decodeFLAC(b.Bytes())
+			if err != nil || r != rate || len(got) != len(in) {
+				t.Fatalf("got rate %d, len %d, err %v", r, len(got), err)
+			}
+		}})
+	}
+	tests = append(tests, testCase{"rate/0 is an error", func(t *testing.T) {
+		if err := EncodeFLAC(&bytes.Buffer{}, 0, signals()["sine"]); err == nil {
+			t.Fatal("want error")
 		}
+	}})
+
+	// A signal shaped like real engine output: an 8 kHz bytebeat held to
+	// 44.1 kHz at 60% volume. Sample-and-hold steps leave sparse large
+	// residuals, which Rice coding handles only moderately well; ~1.6-2x is
+	// the honest result here.
+	for name, formula := range map[string]func(t int) int{
+		"t&t>>8":       func(t int) int { return t & (t >> 8) },
+		"t*(42&t>>10)": func(t int) int { return t * (42 & (t >> 10)) },
+	} {
+		tests = append(tests, testCase{"compression/" + name, func(t *testing.T) {
+			in := make([]int16, 44100*10)
+			for i := range in {
+				v := formula(i*8000/44100) & 255
+				in[i] = int16(float64(v-128) / 128 * 0.6 * 32767)
+			}
+			var b bytes.Buffer
+			EncodeFLAC(&b, 44100, in)
+			ratio := float64(2*len(in)) / float64(b.Len())
+			t.Logf("compression %.1fx", ratio)
+			if ratio < 1.4 {
+				t.Errorf("compression only %.1fx", ratio)
+			}
+		}})
+	}
+
+	// Cross-check against Apple's decoder when it is present and works.
+	for _, name := range []string{"sine", "bytebeat", "noise", "silence"} {
+		tests = append(tests, testCase{"system decoder/" + name, func(t *testing.T) {
+			if _, err := exec.LookPath("afconvert"); err != nil {
+				t.Skip("afconvert not available")
+			}
+			dir := t.TempDir()
+			if !systemFLACWorks(t, dir) {
+				t.Skip("afconvert cannot round-trip its own FLAC output on this machine; " +
+					"the system decoder is unusable as a reference here")
+			}
+			in := signals()[name]
+			src := filepath.Join(dir, name+".flac")
+			dst := filepath.Join(dir, name+".wav")
+			f, _ := os.Create(src)
+			EncodeFLAC(f, 44100, in)
+			f.Close()
+			if out, err := exec.Command("afconvert", "-f", "WAVE", "-d", "LEI16", src, dst).CombinedOutput(); err != nil {
+				t.Fatalf("afconvert: %v %s", err, out)
+			}
+			data, _ := os.ReadFile(dst)
+			pcm := wavData(t, data)
+			if len(pcm) != 2*len(in) {
+				t.Fatalf("decoded %d bytes, want %d", len(pcm), 2*len(in))
+			}
+			for j := range in {
+				if v := int16(binary.LittleEndian.Uint16(pcm[2*j:])); v != in[j] {
+					t.Fatalf("sample %d = %d, want %d", j, v, in[j])
+				}
+			}
+		}})
+	}
+
+	tests = append(tests,
+		testCase{"checksum/crc8", func(t *testing.T) {
+			if c := crc8([]byte("123456789")); c != 0xF4 {
+				t.Errorf("crc8 = %#x", c)
+			}
+		}},
+		testCase{"checksum/crc16", func(t *testing.T) {
+			if c := crc16([]byte("123456789")); c != 0xFEE8 {
+				t.Errorf("crc16 = %#x", c)
+			}
+		}},
+	)
+
+	for _, c := range []struct {
+		v    uint64
+		want []byte
+	}{
+		{0, []byte{0}},
+		{0x7F, []byte{0x7F}},
+		{0x80, []byte{0xC2, 0x80}},
+		{0x7FF, []byte{0xDF, 0xBF}},
+		{0x800, []byte{0xE0, 0xA0, 0x80}},
+	} {
+		tests = append(tests, testCase{fmt.Sprintf("frame number/encode %#x", c.v), func(t *testing.T) {
+			if got := utf8Number(c.v); !bytes.Equal(got, c.want) {
+				t.Errorf("got %x, want %x", got, c.want)
+			}
+		}})
+	}
+	for _, v := range []uint64{1 << 16, 1 << 21, 1 << 26, 1<<36 - 1} {
+		tests = append(tests, testCase{fmt.Sprintf("frame number/round trip %#x", v), func(t *testing.T) {
+			if got, _ := readUTF8(&bitReader{b: utf8Number(v)}); got != v {
+				t.Errorf("got %#x", got)
+			}
+		}})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, tt.check)
 	}
 }
 
@@ -188,66 +241,54 @@ func wavData(t *testing.T, b []byte) []byte {
 }
 
 func TestWAV(t *testing.T) {
-	var b bytes.Buffer
-	if err := Encode(&b, "wav", 44100, []float32{0, 1, -1, float32(math.NaN()), 2}); err != nil {
-		t.Fatal(err)
-	}
-	d := b.Bytes()
-	if len(d) != 44+10 || string(d[0:4]) != "RIFF" || string(d[8:12]) != "WAVE" || string(d[36:40]) != "data" {
-		t.Fatalf("bad header, len %d", len(d))
-	}
-	want := []int16{0, 32767, -32767, 0, 32767}
-	for i, w := range want {
-		if v := int16(binary.LittleEndian.Uint16(d[44+2*i:])); v != w {
-			t.Errorf("sample %d = %d, want %d", i, v, w)
-		}
-	}
-}
-
-func TestWriteFile(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"a.wav", "b.FLAC"} {
-		if err := WriteFile(filepath.Join(dir, name), 8000, []float32{0, .5}); err != nil {
-			t.Fatal(err)
-		}
+	tests := []struct {
+		name  string
+		check func(t *testing.T)
+	}{
+		{"header and quantised samples", func(t *testing.T) {
+			var b bytes.Buffer
+			if err := Encode(&b, "wav", 44100, []float32{0, 1, -1, float32(math.NaN()), 2}); err != nil {
+				t.Fatal(err)
+			}
+			d := b.Bytes()
+			if len(d) != 44+10 || string(d[0:4]) != "RIFF" || string(d[8:12]) != "WAVE" || string(d[36:40]) != "data" {
+				t.Fatalf("bad header, len %d", len(d))
+			}
+			for i, w := range []int16{0, 32767, -32767, 0, 32767} { // NaN -> 0, 2 clipped
+				if v := int16(binary.LittleEndian.Uint16(d[44+2*i:])); v != w {
+					t.Errorf("sample %d = %d, want %d", i, v, w)
+				}
+			}
+		}},
+		{"write .wav", func(t *testing.T) {
+			if err := WriteFile(filepath.Join(dir, "a.wav"), 8000, []float32{0, .5}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"write .FLAC (extension case-insensitive)", func(t *testing.T) {
+			if err := WriteFile(filepath.Join(dir, "b.FLAC"), 8000, []float32{0, .5}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"write .mp3 is an error", func(t *testing.T) {
+			if err := WriteFile(filepath.Join(dir, "c.mp3"), 8000, nil); err == nil {
+				t.Fatal("want error")
+			}
+		}},
+		{"encode ogg is an error", func(t *testing.T) {
+			if err := Encode(&bytes.Buffer{}, "ogg", 8000, nil); err == nil {
+				t.Fatal("want error")
+			}
+		}},
+		{"format from path", func(t *testing.T) {
+			if got := FormatOf("x/Y.Flac"); got != "flac" {
+				t.Errorf("got %q", got)
+			}
+		}},
 	}
-	if err := WriteFile(filepath.Join(dir, "c.mp3"), 8000, nil); err == nil {
-		t.Fatal("want error for mp3")
-	}
-	if err := Encode(&bytes.Buffer{}, "ogg", 8000, nil); err == nil {
-		t.Fatal("want error for ogg")
-	}
-	if FormatOf("x/Y.Flac") != "flac" {
-		t.Fatal(FormatOf("x/Y.Flac"))
-	}
-}
-
-func TestChecksums(t *testing.T) {
-	if c := crc8([]byte("123456789")); c != 0xF4 {
-		t.Errorf("crc8 = %#x", c)
-	}
-	if c := crc16([]byte("123456789")); c != 0xFEE8 {
-		t.Errorf("crc16 = %#x", c)
-	}
-}
-
-func TestUTF8Number(t *testing.T) {
-	cases := map[uint64][]byte{
-		0:     {0},
-		0x7F:  {0x7F},
-		0x80:  {0xC2, 0x80},
-		0x7FF: {0xDF, 0xBF},
-		0x800: {0xE0, 0xA0, 0x80},
-	}
-	for v, want := range cases {
-		if got := utf8Number(v); !bytes.Equal(got, want) {
-			t.Errorf("utf8Number(%#x) = %x, want %x", v, got, want)
-		}
-	}
-	for _, v := range []uint64{1 << 16, 1 << 21, 1 << 26, 1<<36 - 1} {
-		if got, _ := readUTF8(&bitReader{b: utf8Number(v)}); got != v {
-			t.Errorf("round trip %#x = %#x", v, got)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.check)
 	}
 }
 

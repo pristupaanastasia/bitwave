@@ -127,6 +127,17 @@ func NewTrack(name string) Track {
 	}
 }
 
+// EmptySong is what the app starts with: one kick track and no notes, so
+// nothing plays until notes are placed.
+func EmptySong() Song {
+	return Song{
+		BPM: 120, Volume: 0.8,
+		Tracks:   []Track{InstrumentTrack(Instruments[InstrumentIndex("kick")])},
+		Patterns: []Pattern{{Notes: [][Steps]int{rests()}}},
+		Order:    []int{0},
+	}
+}
+
 // DefaultSong is a small demo: drums, hats, bass and lead over two patterns,
 // all made from instrument templates.
 func DefaultSong() Song {

@@ -1,102 +1,165 @@
 # bitwave
 
-Синтезатор электронной музыки на битовых операциях (bytebeat): несколько
-дорожек, паттерны и аранжировка песни, осциллограмма, рисование волны и
-экспорт в WAV/FLAC.
+An electronic music maker built on bytebeat. You get several tracks,
+patterns arranged into a song, an oscilloscope, waves you draw with the mouse,
+and export to WAV or FLAC. You can make music entirely with instruments,
+knobs and the step sequencer. Writing formulas is optional.
+
+## Getting started
+
+Requires Go 1.27 or newer. On Linux, Ebitengine also needs
+`libasound2-dev libgl1-mesa-dev xorg-dev`.
 
 ```sh
-go run .                                    # открыть редактор с демо-песней
-go run . -load bitwave-song.json            # открыть сохранённую песню
-go run . -load bitwave-song.json -o song.flac   # отрендерить всю песню без окна
-go run . -formula 't*(42&t>>10)' -o x.wav     # одна bytebeat-формула, 30 с (или -seconds N)
+go run .                                         # open the editor
+go build -o bitwave . && ./bitwave               # or build a binary first
 ```
 
-## Как устроена песня
+The app opens your last song, or an empty one on the first run. To make a
+beat:
 
-- **Дорожки** (до 8): у каждой свои формула, режим BYTE/FLOAT, `RATE`,
-  нарисованная волна, громкость, **M**ute и **S**olo.
-- **Паттерны** A–P (до 16): в каждом 16 шагов нот для всех дорожек сразу.
-- **Аранжировка** (строка `SONG`): цепочка паттернов, например `A A B B B B A`.
-  Это и есть песня, экспорт выгружает её целиком.
+1. Click the grid at the bottom to place notes on track `1 kick`.
+2. Press `SPACE` to play or stop.
+3. Use `+ TRACK` to add a track, then `INSTRUMENT < >` to pick its sound
+   (hat, bass, lead, ...).
+4. Drag the knobs and the `A D S R GATE` sliders to shape the sound.
 
-## Звук без формул
+Your song is saved automatically (see [Saving](#saving-and-export)).
 
-- **INSTRUMENT `< >`**: шаблоны kick, snare, hat, bass, lead, pad, pluck и bytebeat.
-  Шаблон подставляет формулу, волну, режим и огибающую.
-- **Ручки k1–k4** (строка под дорожкой) подписаны по смыслу инструмента: у kick это
-  pitch/punch/length/drive, у bass — square/crush/sub. Крутите их перетаскиванием
-  мышью, звук меняется сразу. В своей формуле они доступны как `k1`…`k4` (0..1).
-- **ADSR ON/OFF** и ползунки **A D S R** (атака, спад, уровень, затухание) плюс **GATE**
-  (длина ноты в шагах, 0.25–8). При включённой ADSR переменная `e` в формуле — это
-  огибающая, `g` = 1 до конца затухания, а `f` и `p` держат высоту ноты, пока она звучит.
+## How a song is built
 
-## Формулы
+- **Tracks** (up to 8) each have an instrument, four knobs, an envelope,
+  a volume and **M**ute / **S**olo buttons. While a track makes sound, a green
+  bar flickers under its tab.
+- **Patterns** A–P (up to 16) each hold 16 steps of notes for every track.
+- **The song** (the `SONG` strip) is a chain of patterns, e.g. `A A B B A`.
+  `EXPORT` renders this chain from start to end.
 
-Каждая дорожка — это формула, которая вычисляется `RATE` раз в секунду.
-Семантика как в JavaScript, поэтому формулы с bytebeat-сайтов работают как есть.
+## Shaping sound without formulas
 
-| Переменная | Значение |
+- **INSTRUMENT `< >`** picks a template: kick, snare, hat, bass, lead, pad,
+  pluck or bytebeat. It sets up the whole sound of the track.
+- **Knobs k1–k4** (the row under the track settings) are named for the
+  instrument: kick has pitch / punch / length / drive, bass has square / crush
+  / sub, and so on. Drag a knob with the mouse and you hear the change at once.
+- **ADSR ON/OFF** and the **A D S R** sliders set attack, decay, sustain level
+  and release. **GATE** sets how long a note is held, in steps (0.25–8).
+- **Wave panel** (orange): draw a waveform with the mouse, or click
+  SINE / SQUARE / SAW / TRIANGLE / NOISE. Instruments that play the drawn wave,
+  such as bass and pluck, use it right away.
+
+## The interface
+
+- **Transport**: `PLAY`/`STOP`, `RESET` (back to the start), `PLAY SONG` ⇄
+  `LOOP PATTERN` (loop the pattern you are editing), `BPM`, `MASTER` volume.
+  `NEW SONG` starts over with an empty song. It asks for a second click,
+  `CLEAR ALL?`, so one stray click cannot erase your work.
+- **Track tabs**: click a name to select the track. `M` and `S` mute and solo
+  it. `+ TRACK` and `- TRACK` add or remove tracks.
+- **Pattern buttons A B …**: pick the pattern to edit. A pink underline marks
+  the pattern playing right now. `NEW` adds an empty pattern, `COPY` duplicates
+  the current one, `DELETE` removes it. Deleting also removes its slots from
+  the song, and later letters move up (C becomes B).
+- **SONG strip**:
+  - Left click a slot to select it, jump there and open its pattern.
+  - Right click a slot to put the current pattern into it.
+  - `+ TO SONG` appends the current pattern.
+  - `- FROM SONG` removes the selected slot, or the last slot if none is
+    selected.
+- **Sequencer grid**: shows the notes of the selected track in the selected
+  pattern. Click to set or clear a note. `OCT ±` scrolls octaves, `CLEAR`
+  empties the row.
+- **Oscilloscope**: `VIEW WAVE` / `VIEW BITS` shows either the waveform or
+  the 8 bits of the track's output byte, as bit planes. `SHOW MIX` /
+  `SHOW TRACK` and `ZOOM ±` change what it shows and how much.
+
+## Saving and export
+
+- **Autosave**: the song is saved every 2 seconds after a change, and when
+  the window closes. It goes to
+  `~/Library/Application Support/bitwave/song.json` (macOS), or the matching
+  user config directory on Linux and Windows. The app reopens it on start.
+- **SAVE** opens the system "Save as" dialog, so you can keep copies under
+  any name (`.json` is added if missing). **LOAD** opens a song file. Older
+  single-track `bitwave-patch.json` files open too.
+- **EXPORT WAV / EXPORT FLAC** asks where to save, then renders the whole
+  song in the background while you keep playing.
+  - WAV is uncompressed 16-bit mono PCM at 44.1 kHz.
+  - FLAC is lossless and usually 1.5–2.5× smaller for bytebeat. It uses
+    bitwave's own pure-Go encoder, checked bit-exact against Apple's decoder
+    and `mewkiz/flac`.
+  - Both open in QuickTime, VLC, browsers and any DAW.
+
+From the command line:
+
+```sh
+./bitwave -load song.json -o song.flac        # render a saved song once
+./bitwave -formula 't*(42&t>>10)' -o x.wav    # one formula, 30 s (or -seconds N)
+./bitwave -help                               # all flags
+```
+
+## Formulas (optional)
+
+The formula editor is hidden by default. **SHOW FORMULA** reveals it, along
+with `MODE`, `RATE` and formula presets. Each track is a formula evaluated
+`RATE` times per second. Every valid edit is heard immediately. If the
+formula has an error, the last valid one keeps playing. `Cmd/Ctrl+V` pastes.
+
+The semantics follow JavaScript, so formulas from bytebeat sites work as is.
+
+| Variable | Meaning |
 |---|---|
-| `t` | время в сэмплах (растёт на `RATE` в секунду) |
-| `p` | фаза текущей ноты секвенсора: +256 за период |
-| `f` | частота ноты, Гц (0 на паузе) |
-| `g` | gate: 1 пока звучит нота, 0 на паузе |
-| `e` | огибающая: ADSR, если включена, иначе 1 в начале шага → 0 в конце |
-| `n` | тики с начала текущей ноты: удобно для ударных |
-| `s` | номер шага 0..15 |
+| `t` | time in samples (grows by `RATE` per second) |
+| `p` | phase of the current note: +256 per period |
+| `f` | note frequency in Hz (0 on a rest) |
+| `g` | gate: 1 while a note sounds, 0 on a rest |
+| `e` | envelope: the ADSR when on, otherwise 1 → 0 over each step |
+| `n` | ticks since the current note started (handy for drums) |
+| `s` | step number 0..15 |
 | `r` | `RATE` |
-| `k1`…`k4` | ручки дорожки, 0..1 |
-| `w(x)` | нарисованная волна, 256 точек, значения 0..255 |
+| `k1`…`k4` | the track's knobs, 0..1 |
+| `w(x)` | the drawn wave: 256 points, values 0..255 |
 
-Операторы: `+ - * / % ** & | ^ ~ << >> >>> < > <= >= == != && || ! a?b:c`,
-массивы `[a,b,c][i]` (как в JS: индекс вне диапазона даёт NaN, в битовых операциях это 0, так что маскируйте `i&3`), функции `sin cos tan tanh abs floor
-ceil round sqrt pow min max log exp random …` (префикс `Math.` можно писать).
+Operators: `+ - * / % ** & | ^ ~ << >> >>> < > <= >= == != && || ! a?b:c`.
 
-**MODE BYTE**: классический bytebeat, результат `& 255` → 0..255.
-**MODE FLOAT**: результат используется напрямую в диапазоне −1..1.
+Arrays: `[a,b,c][i]`. As in JS, an index out of range is `NaN`, which is 0
+in bit operations, so mask it: `[a,b,c,d][t>>12&3]`.
 
-Примеры: `128+(w(p)-128)*e` (нарисованная волна по нотам), `t*(42&t>>10)`,
-`(t*(t>>5|t>>8))>>(t>>16)`, `sin(p/128*PI)*e*.7` (FLOAT),
-кик: `g*sin(2*PI*(50*n/r+5*(1-exp(-n/r*30))))*exp(-n/r*9)` (FLOAT),
-хэт: `128+(random()*255-128)*e**6*g` (BYTE).
+Functions: `sin cos tan tanh abs floor ceil round sqrt pow min max log exp
+random …`. A `Math.` prefix is allowed.
 
-## Интерфейс
+- **MODE BYTE**: classic bytebeat, the result `& 255` → 0..255.
+- **MODE FLOAT**: the result is used directly, clamped to −1..1.
 
-- **Транспорт**: `PLAY SONG` играет аранжировку, по клику переключается в
-  `LOOP PATTERN` (зацикливает паттерн, который вы правите). `BPM`, `MASTER`.
-- **Вкладки дорожек**: клик по имени выбирает дорожку, `M`/`S` — mute/solo, `+ TRACK` / `- TRACK`.
-  Строка под ними задаёт настройки выбранной дорожки: режим, `RATE`, громкость, пресет формулы.
-- **Формула** выбранной дорожки: клик и редактирование, каждое корректное
-  изменение слышно сразу; при ошибке продолжает играть последняя рабочая
-  формула. Cmd/Ctrl+V — вставка.
-- **Осциллограф**: `VIEW WAVE`/`VIEW BITS` (8 битов выходного байта дорожки),
-  `SHOW MIX`/`SHOW TRACK`, `ZOOM ±`.
-- **Волна** выбранной дорожки рисуется мышью, есть готовые формы SINE/SQUARE/SAW/TRIANGLE/NOISE.
-- **PATTERN A B …**: выбор паттерна для редактирования, `NEW` — пустой, `COPY` — копия текущего.
-- **SONG**: клик по ячейке переходит туда и открывает её паттерн, **правый клик**
-  ставит в ячейку текущий паттерн. `+ TO SONG` / `- FROM SONG` — добавить
-  в конец или убрать последний.
-- **Секвенсор**: ноты выбранной дорожки в выбранном паттерне. Клик ставит или снимает
-  ноту, `OCT ±` листает октавы, `CLEAR` очищает.
-- **EXPORT WAV / FLAC** рендерит всю песню в текущую папку. **SAVE/LOAD**
-  работают с `bitwave-song.json`; старый `bitwave-patch.json` тоже
-  загружается, как песня из одной дорожки.
-- `SPACE` — play/stop.
+Examples:
 
-Форматы: WAV — несжатый PCM 16 бит моно 44.1 кГц. FLAC — сжатие без потерь
-(собственный энкодер на чистом Go), на bytebeat обычно в 1.5–2.5 раза меньше WAV.
-Оба формата открываются в QuickTime, VLC, браузерах и DAW.
+- `128+(w(p)-128)*e`: the drawn wave played by the notes
+- `t*(42&t>>10)` and `(t*(t>>5|t>>8))>>(t>>16)`: classic bytebeats
+- `sin(p/128*PI)*e*.7` (FLOAT): a sine played by the notes
 
-## Разработка
+## Development
 
 ```sh
-scripts/install-hooks.sh   # один раз после клона
-scripts/coverage.sh        # тесты + порог покрытия 70%
+scripts/install-hooks.sh   # once after cloning
+scripts/coverage.sh        # tests + the 70% coverage gate
+go test -race ./...
 ```
 
-Хук `pre-push` запрещает пуш в `main`/`master` и не пропускает пуш при покрытии
-ниже 70%. Та же проверка запускается в CI (`.github/workflows/ci.yml`).
-Чтобы правило нельзя было обойти через `--no-verify`, включите на GitHub
-branch protection для `main`.
+- Tests are table-driven, one test per feature: cases in a slice, run with
+  `for … range` and `t.Run`.
+- The `pre-push` hook refuses pushes to `main` / `master` and pushes with
+  coverage below 70%. CI (`.github/workflows/ci.yml`) runs the same check.
+  `--no-verify` skips the hook, so enable branch protection for `main` on
+  GitHub as well.
+- The `.claude/agents/reviewer.md` subagent reviews code changes.
 
-Ревью кода делает субагент `.claude/agents/reviewer.md`.
+Layout:
+
+| Package | What it does |
+|---|---|
+| `internal/expr` | formula lexer, parser and compiler to closures |
+| `internal/synth` | song model, instruments, ADSR, audio engine |
+| `internal/audiofile` | WAV and FLAC writers |
+| `internal/ui` | the Ebitengine interface |
+| `internal/dialog` | native Save/Open dialogs (osascript, zenity, PowerShell) |
+| `internal/clipboard` | paste support without cgo |
