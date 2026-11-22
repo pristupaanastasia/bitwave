@@ -12,14 +12,15 @@ const WaveSize = 256
 // Env holds the variables visible to a formula. The engine updates the
 // fields before every Eval call.
 type Env struct {
-	T float64 // sample counter at the formula sample rate
-	P float64 // phase of the current note: advances by 256 per period
-	F float64 // frequency of the current note in Hz, 0 on a rest
-	G float64 // gate: 1 while a note is active, 0 on a rest
-	S float64 // index of the current sequencer step
-	E float64 // envelope: 1 at the note start, decays linearly to 0
-	R float64 // formula sample rate in Hz
-	N float64 // formula ticks since the current note started (for drums)
+	T float64    // sample counter at the formula sample rate
+	P float64    // phase of the current note: advances by 256 per period
+	F float64    // frequency of the current note in Hz, 0 on a rest
+	G float64    // gate: 1 while a note is active, 0 on a rest
+	S float64    // index of the current sequencer step
+	E float64    // envelope: 1 at the note start, decays linearly to 0
+	R float64    // formula sample rate in Hz
+	N float64    // formula ticks since the current note started (for drums)
+	K [4]float64 // knobs k1..k4 set from the UI, 0..1
 
 	Wave *[WaveSize]float64 // drawn wave, values in 0..255
 
@@ -365,12 +366,15 @@ func variable(t token) (node, error) {
 		return node{fn: func(e *Env) float64 { return e.R }, pos: t.pos}, nil
 	case "n":
 		return node{fn: func(e *Env) float64 { return e.N }, pos: t.pos}, nil
+	case "k1", "k2", "k3", "k4":
+		i := t.text[1] - '1'
+		return node{fn: func(e *Env) float64 { return e.K[i] }, pos: t.pos}, nil
 	case "PI":
 		return constNode(math.Pi, t.pos), nil
 	case "E":
 		return constNode(math.E, t.pos), nil
 	}
-	return node{}, &Error{t.pos, fmt.Sprintf("unknown variable %q (use t p f g s e n r)", t.text)}
+	return node{}, &Error{t.pos, fmt.Sprintf("unknown variable %q (use t p f g s e n r k1..k4)", t.text)}
 }
 
 var funcs1 = map[string]func(float64) float64{
@@ -379,6 +383,7 @@ var funcs1 = map[string]func(float64) float64{
 	"abs": math.Abs, "floor": math.Floor, "ceil": math.Ceil,
 	"round": func(x float64) float64 { return math.Floor(x + 0.5) }, // JS rounding
 	"trunc": math.Trunc, "int": math.Trunc,
+	"tanh": math.Tanh, // soft saturation, handy for drive
 	"sqrt": math.Sqrt, "cbrt": math.Cbrt, "exp": math.Exp,
 	"log": math.Log, "log2": math.Log2, "log10": math.Log10,
 	"sign": func(x float64) float64 {

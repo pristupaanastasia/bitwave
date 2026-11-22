@@ -26,6 +26,58 @@ type Track struct {
 	Volume  float64                `json:"volume"`
 	Mute    bool                   `json:"mute"`
 	Solo    bool                   `json:"solo"`
+
+	Instrument string     `json:"instrument,omitempty"` // template it was made from
+	Knobs      [4]float64 `json:"knobs"`                // k1..k4 in the formula, 0..1
+	KnobNames  [4]string  `json:"knob_names"`
+	Env        ADSR       `json:"adsr"`
+}
+
+// ADSR is a per-track amplitude envelope. When On, the formula variable e
+// is this envelope (instead of the linear per-step decay), g stays 1 and f/p
+// keep the note's pitch through the release.
+type ADSR struct {
+	On   bool    `json:"on"`
+	A    float64 `json:"a"`    // attack, seconds
+	D    float64 `json:"d"`    // decay, seconds
+	S    float64 `json:"s"`    // sustain level 0..1
+	R    float64 `json:"r"`    // release, seconds
+	Gate float64 `json:"gate"` // note length in steps before release
+}
+
+// Envelope limits.
+const (
+	MaxAttack  = 4.0
+	MaxDecay   = 4.0
+	MaxRelease = 8.0
+	MinGate    = 0.25
+	MaxGate    = 16.0
+)
+
+func defaultKnobNames() [4]string { return [4]string{"k1", "k2", "k3", "k4"} }
+
+// level returns the envelope value dt seconds after note-on for a note held
+// gate seconds, starting from level start (so retriggers do not click), and
+// whether the release has finished.
+func (a ADSR) level(start, dt, gate float64) (float64, bool) {
+	held := func(dt float64) float64 {
+		if dt < a.A {
+			return start + (1-start)*dt/a.A
+		}
+		dt -= a.A
+		if dt < a.D {
+			return 1 + (a.S-1)*dt/a.D
+		}
+		return a.S
+	}
+	if dt < gate {
+		return held(dt), false
+	}
+	r := dt - gate
+	if r >= a.R {
+		return 0, true
+	}
+	return held(gate) * (1 - r/a.R), false
 }
 
 // Pattern holds 16 steps of notes for every track: Notes[track][step].
@@ -64,35 +116,29 @@ func notes(spec map[int]int) [Steps]int {
 // NewTrack returns a track that plays its drawn wave through the sequencer.
 func NewTrack(name string) Track {
 	return Track{
-		Name:    name,
-		Formula: "128+(w(p)-128)*e",
-		Mode:    ModeByte,
-		Rate:    8000,
-		Wave:    Shape("saw"),
-		Volume:  0.7,
+		Name:      name,
+		Formula:   "128+(w(p)-128)*e",
+		Mode:      ModeByte,
+		Rate:      8000,
+		Wave:      Shape("saw"),
+		Volume:    0.7,
+		KnobNames: defaultKnobNames(),
+		Env:       ADSR{A: 0.005, D: 0.15, S: 0.6, R: 0.15, Gate: 1},
 	}
 }
 
-// DefaultSong is a small demo: drums, hats, bass and lead over two patterns.
+// DefaultSong is a small demo: drums, hats, bass and lead over two patterns,
+// all made from instrument templates.
 func DefaultSong() Song {
-	drums := Track{
-		Name: "kick",
-		// A sine whose pitch falls from ~200 Hz to 50 Hz with a fast decay.
-		Formula: "g*sin(2*PI*(50*n/r+5*(1-exp(-n/r*30))))*exp(-n/r*9)",
-		Mode:    ModeFloat, Rate: 44100, Wave: Shape("sine"), Volume: 0.9,
+	inst := func(name, trackName string) Track {
+		t := InstrumentTrack(Instruments[InstrumentIndex(name)])
+		t.Name = trackName
+		return t
 	}
-	hats := Track{
-		Name:    "hats",
-		Formula: "128+(random()*255-128)*e**6*g",
-		Mode:    ModeByte, Rate: 22050, Wave: Shape("noise"), Volume: 0.35,
-	}
-	bass := NewTrack("bass")
-	bass.Formula = "128+(w(p)-128)*min(1,e*3)"
-	bass.Volume = 0.6
-	lead := NewTrack("lead")
-	lead.Formula = "128+(w(p)-128)*e*e"
-	lead.Wave = Shape("square")
-	lead.Volume = 0.35
+	drums := inst("kick", "kick")
+	hats := inst("hat", "hats")
+	bass := inst("bass", "bass")
+	lead := inst("lead", "lead")
 
 	kick := notes(map[int]int{0: 36, 4: 36, 8: 36, 12: 36})
 	hat := notes(map[int]int{2: 60, 6: 60, 10: 60, 14: 60})
@@ -143,6 +189,21 @@ func sanitize(s Song) Song {
 		if t.Mode != ModeByte && t.Mode != ModeFloat {
 			t.Mode = ModeByte
 		}
+		for k := range t.Knobs {
+			t.Knobs[k] = clamp01(t.Knobs[k])
+			if t.KnobNames[k] == "" {
+				t.KnobNames[k] = fmt.Sprintf("k%d", k+1)
+			}
+		}
+		en := &t.Env
+		en.A = clampNaN(en.A, 0, MaxAttack)
+		en.D = clampNaN(en.D, 0, MaxDecay)
+		en.S = clamp01(en.S)
+		en.R = clampNaN(en.R, 0, MaxRelease)
+		if en.Gate == 0 {
+			en.Gate = 1 // files from before ADSR existed
+		}
+		en.Gate = clampNaN(en.Gate, MinGate, MaxGate)
 		for j, v := range t.Wave {
 			if v != v { // NaN
 				t.Wave[j] = 128
@@ -183,6 +244,16 @@ func sanitize(s Song) Song {
 	}
 	s.Order = order[:min(len(order), MaxOrder)]
 	return s
+}
+
+func clamp01(v float64) float64 { return clampNaN(v, 0, 1) }
+
+// clampNaN clamps v to [lo, hi], mapping NaN to lo.
+func clampNaN(v, lo, hi float64) float64 {
+	if v != v {
+		return lo
+	}
+	return min(max(v, lo), hi)
 }
 
 // legacyPatch is the single-track format written by earlier versions.

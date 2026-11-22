@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -439,5 +440,107 @@ func TestExportWholeSong(t *testing.T) {
 	bad.Tracks[0].Formula = "t>>"
 	if s := exportSong(bad, "wav", time.Now()); !strings.HasPrefix(s, "export failed") {
 		t.Fatal(s)
+	}
+}
+
+func TestSoundControls(t *testing.T) {
+	sliderNamed := func(g *Game, prefix string) int {
+		g.layout()
+		for i, sl := range g.sliders {
+			if strings.HasPrefix(sl.label(), prefix) {
+				return i
+			}
+		}
+		t.Fatalf("no slider %q", prefix)
+		return -1
+	}
+	cases := []struct {
+		name  string
+		check func(t *testing.T, g *Game)
+	}{
+		{"instrument next replaces sound and formula", func(t *testing.T, g *Game) {
+			g.selectTrack(0) // kick
+			press(t, g, ">") // first ">" on the track row is the formula preset
+			g.loadInstrument(synth.InstrumentIndex("kick") + 1)
+			tr := g.eng.Song().Tracks[0]
+			if tr.Instrument != "snare" || tr.Name != "snare" || g.edit.String() != tr.Formula || tr.KnobNames[1] != "noise" {
+				t.Errorf("%+v", tr)
+			}
+		}},
+		{"instrument prev wraps around", func(t *testing.T, g *Game) {
+			g.selectTrack(0)
+			g.loadInstrument(-1)
+			if got := g.eng.Song().Tracks[0].Instrument; got != synth.Instruments[len(synth.Instruments)-1].Name {
+				t.Errorf("got %q", got)
+			}
+		}},
+		{"knob slider label uses instrument names", func(t *testing.T, g *Game) {
+			g.selectTrack(0) // kick: pitch, punch, length, drive
+			sliderNamed(g, "pitch")
+			sliderNamed(g, "drive")
+		}},
+		{"click and drag sets a knob", func(t *testing.T, g *Game) {
+			g.selectTrack(0)
+			i := sliderNamed(g, "pitch")
+			r := g.sliders[i].r
+			g.click(r.x, r.y+5, false) // left edge: 0
+			if g.dragging != i || g.eng.Song().Tracks[0].Knobs[0] != 0 {
+				t.Fatalf("dragging %d knob %v", g.dragging, g.eng.Song().Tracks[0].Knobs[0])
+			}
+			g.dragSlider(i, r.x+r.w-1) // right edge: 1
+			if v := g.eng.Song().Tracks[0].Knobs[0]; v != 1 {
+				t.Errorf("after drag %v", v)
+			}
+			g.dragSlider(i, r.x+r.w+500) // clamped
+			g.dragSlider(99, 0)          // out of range: ignored
+			if v := g.eng.Song().Tracks[0].Knobs[0]; v != 1 {
+				t.Errorf("clamp %v", v)
+			}
+		}},
+		{"ADSR toggle and dimmed sliders", func(t *testing.T, g *Game) {
+			g.selectTrack(2) // bass: ADSR on
+			press(t, g, "ADSR ON")
+			if g.eng.Song().Tracks[2].Env.On {
+				t.Fatal("still on")
+			}
+			g.layout()
+			if i := sliderNamed(g, "A "); !g.sliders[i].dimmed() {
+				t.Error("A slider should be dimmed with ADSR off")
+			}
+			press(t, g, "ADSR OFF")
+			if !g.eng.Song().Tracks[2].Env.On {
+				t.Error("not back on")
+			}
+		}},
+		{"envelope sliders round-trip", func(t *testing.T, g *Game) {
+			for _, p := range envParams {
+				for _, v := range []float64{0, 0.25, 0.5, 1} {
+					var e synth.ADSR
+					p.set(&e, v)
+					if got := p.get(e); math.Abs(got-v) > 1e-9 {
+						t.Errorf("%s: get(set(%v)) = %v", p.label(e), v, got)
+					}
+				}
+			}
+		}},
+		{"gate slider spans 0.25 to 8 steps", func(t *testing.T, g *Game) {
+			var e synth.ADSR
+			gate := envParams[len(envParams)-1]
+			gate.set(&e, 0)
+			lo := e.Gate
+			gate.set(&e, 1)
+			if lo != 0.25 || e.Gate != 8 {
+				t.Errorf("gate %v..%v", lo, e.Gate)
+			}
+		}},
+		{"no slider under empty space", func(t *testing.T, g *Game) {
+			g.layout()
+			if g.sliderAt(Width-1, Height-1) != -1 {
+				t.Error("found a slider in the corner")
+			}
+		}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) { tt.check(t, newTestGame(t)) })
 	}
 }

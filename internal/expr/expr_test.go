@@ -146,9 +146,22 @@ func TestFunctionsAndUnary(t *testing.T) {
 	}
 }
 
+func TestKnobsAndTanh(t *testing.T) {
+	env := &Env{K: [4]float64{0.1, 0.2, 0.3, 0.4}}
+	if got := eval(t, "k1+k2*10+k3*100+k4*1000", env); math.Abs(got-(0.1+2+30+400)) > 1e-9 {
+		t.Fatal(got)
+	}
+	if got := eval(t, "tanh(100)", env); got != 1 {
+		t.Fatal(got)
+	}
+	if _, err := Compile("k5"); err == nil {
+		t.Fatal("k5 must not exist")
+	}
+}
+
 func TestErrorMessage(t *testing.T) {
 	_, err := Compile("t + foo")
-	if err == nil || err.Error() != `col 5: unknown variable "foo" (use t p f g s e n r)` {
+	if err == nil || err.Error() != `col 5: unknown variable "foo" (use t p f g s e n r k1..k4)` {
 		t.Fatalf("%v", err)
 	}
 	for _, src := range []string{"min()", "random(1)", "w()", "pow(1)", "0x", "1.2.3", "-[1,2]", "[1,2]+1", "sin([1])", "[[1]]", "(1)[0]", "t ? [1] : 2"} {

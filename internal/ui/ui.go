@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/color"
 	"io/fs"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -26,7 +27,7 @@ import (
 
 const (
 	Width      = 1100
-	Height     = 830
+	Height     = 880
 	SampleRate = 44100
 
 	charW   = 6
@@ -63,18 +64,19 @@ const (
 	rowTransport = 8
 	rowTracks    = 36
 	rowTrackCtl  = 64
-	rowPatterns  = 404
-	rowSeqCtl    = 474
+	rowSound     = 92
+	rowPatterns  = 436
+	rowSeqCtl    = 506
 	tabW         = 110
 	cellW        = 16
 )
 
 var (
-	formulaR = rect{10, 92, Width - 20, 24}
-	scopeR   = rect{10, 146, 640, 220}
-	waveR    = rect{660, 146, Width - 670, 220}
-	orderR   = rect{60, 434, synth.MaxOrder * cellW, 22}
-	seqR     = rect{50, 520, Width - 60, seqRows * 10}
+	formulaR = rect{10, 124, Width - 20, 24}
+	scopeR   = rect{10, 178, 640, 220}
+	waveR    = rect{660, 178, Width - 670, 220}
+	orderR   = rect{60, 466, synth.MaxOrder * cellW, 22}
+	seqR     = rect{50, 552, Width - 60, seqRows * 10}
 )
 
 type button struct {
@@ -82,6 +84,16 @@ type button struct {
 	label   func() string
 	onClick func()
 	on      func() bool // highlighted state, optional
+}
+
+// slider is a horizontal control dragged with the mouse. Its value is
+// normalised to 0..1; get/set map it to the real parameter.
+type slider struct {
+	r      rect
+	label  func() string
+	get    func() float64
+	set    func(float64)
+	dimmed func() bool // drawn faded, e.g. ADSR controls while ADSR is off
 }
 
 // Game implements ebiten.Game.
@@ -113,6 +125,8 @@ type Game struct {
 	lastV   float64
 
 	buttons  []button
+	sliders  []slider
+	dragging int // index of the slider being dragged, -1 if none
 	scopeBuf []float32
 	blink    int
 
@@ -143,6 +157,7 @@ func newGame(eng *synth.Engine) *Game {
 		statusCh: make(chan string, 4),
 		preset:   -1,
 		scopeMix: true,
+		dragging: -1,
 	}
 	g.selectTrack(0)
 	g.layout()
@@ -327,6 +342,16 @@ func (g *Game) loadPreset(i int) {
 	g.preset = i
 }
 
+// loadInstrument replaces the selected track's sound with a template.
+func (g *Game) loadInstrument(i int) {
+	n := len(synth.Instruments)
+	in := synth.Instruments[(i%n+n)%n]
+	g.editTrack(func(t *synth.Track) { synth.ApplyInstrument(t, in) })
+	g.edit.Set(in.Formula)
+	g.formulaErr = ""
+	g.preset = -1
+}
+
 func (g *Game) applyFormula() {
 	g.preset = -1
 	if err := g.eng.SetFormula(g.track, g.edit.String()); err != nil {
@@ -410,6 +435,7 @@ func LoadSong(path string) (synth.Song, error) {
 
 func (g *Game) layout() {
 	g.buttons = g.buttons[:0]
+	g.sliders = g.sliders[:0]
 	g.snap = g.eng.Song()
 	s := g.snap
 	x := 10
@@ -507,6 +533,17 @@ func (g *Game) layout() {
 		return synth.Presets[g.preset].Name
 	}, 130, nil)
 	add(y, text(">"), 20, func() { g.loadPreset(g.preset + 1) })
+	x += 8
+	add(y, text("<"), 20, func() { g.loadInstrument(synth.InstrumentIndex(g.snapTrack().Instrument) - 1) })
+	add(y, func() string {
+		if in := g.snapTrack().Instrument; in != "" {
+			return "INSTRUMENT " + in
+		}
+		return "INSTRUMENT"
+	}, 130, nil)
+	add(y, text(">"), 20, func() { g.loadInstrument(synth.InstrumentIndex(g.snapTrack().Instrument) + 1) })
+
+	g.layoutSound()
 
 	// Oscilloscope and wave shapes.
 	x = scopeR.x
@@ -554,6 +591,107 @@ func (g *Game) layout() {
 	add(y, text("CLEAR"), 0, g.clearSteps)
 }
 
+// layoutSound builds the knob and ADSR controls of the selected track.
+func (g *Game) layoutSound() {
+	x, y := 10, rowSound
+	addSlider := func(w int, label func() string, get func() float64, set func(float64), dimmed func() bool) {
+		g.sliders = append(g.sliders, slider{rect{x, y, w, 22}, label, get, set, dimmed})
+		x += w + 4
+	}
+	for k := range 4 {
+		addSlider(150,
+			func() string {
+				t := g.snapTrack()
+				return fmt.Sprintf("%s %.2f", t.KnobNames[k], t.Knobs[k])
+			},
+			func() float64 { return g.snapTrack().Knobs[k] },
+			func(v float64) { g.editTrack(func(t *synth.Track) { t.Knobs[k] = v }) },
+			nil)
+	}
+
+	b := button{r: rect{x, y, 66, 22}, label: func() string {
+		if g.snapTrack().Env.On {
+			return "ADSR ON"
+		}
+		return "ADSR OFF"
+	}, onClick: func() { g.editTrack(func(t *synth.Track) { t.Env.On = !t.Env.On }) }}
+	b.on = func() bool { return g.snapTrack().Env.On }
+	g.buttons = append(g.buttons, b)
+	x += 70
+
+	off := func() bool { return !g.snapTrack().Env.On }
+	env := func(fn func(e *synth.ADSR)) { g.editTrack(func(t *synth.Track) { fn(&t.Env) }) }
+	for _, p := range envParams {
+		addSlider(70,
+			func() string { return p.label(g.snapTrack().Env) },
+			func() float64 { return p.get(g.snapTrack().Env) },
+			func(v float64) { env(func(e *synth.ADSR) { p.set(e, v) }) },
+			off)
+	}
+}
+
+// envParam maps a 0..1 slider to an envelope field. Times use a square
+// curve so short values, which matter most, get most of the travel.
+type envParam struct {
+	label func(synth.ADSR) string
+	get   func(synth.ADSR) float64
+	set   func(*synth.ADSR, float64)
+}
+
+var envParams = []envParam{
+	{
+		func(e synth.ADSR) string { return fmt.Sprintf("A %.2fs", e.A) },
+		func(e synth.ADSR) float64 { return math.Sqrt(e.A / maxEnvTime) },
+		func(e *synth.ADSR, v float64) { e.A = v * v * maxEnvTime },
+	},
+	{
+		func(e synth.ADSR) string { return fmt.Sprintf("D %.2fs", e.D) },
+		func(e synth.ADSR) float64 { return math.Sqrt(e.D / maxEnvTime) },
+		func(e *synth.ADSR, v float64) { e.D = v * v * maxEnvTime },
+	},
+	{
+		func(e synth.ADSR) string { return fmt.Sprintf("S %.2f", e.S) },
+		func(e synth.ADSR) float64 { return e.S },
+		func(e *synth.ADSR, v float64) { e.S = v },
+	},
+	{
+		func(e synth.ADSR) string { return fmt.Sprintf("R %.2fs", e.R) },
+		func(e synth.ADSR) float64 { return math.Sqrt(e.R / maxRelease) },
+		func(e *synth.ADSR, v float64) { e.R = v * v * maxRelease },
+	},
+	{
+		// Gate in steps on an exponential scale: 0.25 .. 8.
+		func(e synth.ADSR) string { return fmt.Sprintf("GATE %.2g", e.Gate) },
+		func(e synth.ADSR) float64 { return math.Log2(e.Gate/synth.MinGate) / gateOctaves },
+		func(e *synth.ADSR, v float64) { e.Gate = synth.MinGate * math.Pow(2, v*gateOctaves) },
+	},
+}
+
+const (
+	maxEnvTime  = 2.0 // seconds at the end of the A and D sliders
+	maxRelease  = 4.0
+	gateOctaves = 5 // 0.25 * 2^5 = 8 steps
+)
+
+// sliderAt returns the slider under (mx, my), or -1.
+func (g *Game) sliderAt(mx, my int) int {
+	for i, sl := range g.sliders {
+		if sl.r.contains(mx, my) {
+			return i
+		}
+	}
+	return -1
+}
+
+// dragSlider sets slider i from the mouse x position.
+func (g *Game) dragSlider(i, mx int) {
+	if i < 0 || i >= len(g.sliders) {
+		return
+	}
+	sl := g.sliders[i]
+	sl.set(min(max(float64(mx-sl.r.x)/float64(sl.r.w-1), 0), 1))
+}
+
 func stepRate(r, dir int) int {
 	rates := []int{1000, 2000, 4000, 8000, 11025, 16000, 22050, 32000, 44100, 48000}
 	for i, v := range rates {
@@ -577,6 +715,11 @@ func (g *Game) click(mx, my int, right bool) {
 		return
 	}
 	g.focus = formulaR.contains(mx, my)
+	if i := g.sliderAt(mx, my); i >= 0 {
+		g.dragging = i
+		g.dragSlider(i, mx)
+		return
+	}
 	for _, b := range g.buttons {
 		if b.onClick != nil && b.r.contains(mx, my) {
 			b.onClick()
@@ -602,6 +745,13 @@ func (g *Game) Update() error {
 	}
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight) {
 		g.click(mx, my, true)
+	}
+	if g.dragging >= 0 {
+		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+			g.dragSlider(g.dragging, mx)
+		} else {
+			g.dragging = -1
+		}
 	}
 	g.updateWaveDrawing(mx, my)
 	if g.focus {
@@ -721,16 +871,34 @@ func (g *Game) Draw(dst *ebiten.Image) {
 		}
 		ebitenutil.DebugPrintAt(dst, label, b.r.x+(b.r.w-len(label)*charW)/2, b.r.y+3)
 	}
+	g.drawSliders(dst)
 	g.drawFormula(dst, st)
 	g.drawScope(dst)
 	g.drawWave(dst, song, st)
 	g.drawOrder(dst, song, st)
 	g.drawSequencer(dst, song, st)
 
-	help := "vars: t time  p note phase (256/period)  f Hz  g gate  e envelope  n ticks since note  s step  r rate   w(x) drawn wave\n" +
-		"ops: + - * / % ** & | ^ ~ << >> >>> < > == != && || !  a?b:c  [a,b,c][i]  sin cos abs floor min max pow exp random ...\n" +
-		"SPACE play/stop  click formula to edit (Cmd/Ctrl+V paste)  draw in the wave panel  SONG strip: click = jump, right click = put pattern"
+	help := "vars: t time  p note phase  f Hz  g gate  e envelope  n ticks since note  s step  r rate  k1..k4 knobs  w(x) drawn wave\n" +
+		"ops: + - * / % ** & | ^ ~ << >> >>> < > == != && || !  a?b:c  [a,b,c][i]  sin cos tanh abs floor min max pow exp random ...\n" +
+		"SPACE play/stop  INSTRUMENT < > picks a sound, drag the knobs  k1..k4 and ADSR (e)  click formula to edit  SONG: click = jump, right click = put"
 	ebitenutil.DebugPrintAt(dst, help, 10, Height-50)
+}
+
+func (g *Game) drawSliders(dst *ebiten.Image) {
+	for i, sl := range g.sliders {
+		fg := colWave
+		if sl.dimmed != nil && sl.dimmed() {
+			fg = colBtnHot
+		}
+		fill(dst, sl.r, colPanel2)
+		w := float32(sl.get()) * float32(sl.r.w)
+		vector.FillRect(dst, float32(sl.r.x), float32(sl.r.y+sl.r.h-4), w, 4, fg, false)
+		vector.FillRect(dst, float32(sl.r.x)+w-1, float32(sl.r.y), 2, float32(sl.r.h), fg, false)
+		if i == g.dragging {
+			vector.StrokeRect(dst, float32(sl.r.x), float32(sl.r.y), float32(sl.r.w), float32(sl.r.h), 1, colFocus, false)
+		}
+		ebitenutil.DebugPrintAt(dst, sl.label(), sl.r.x+4, sl.r.y+2)
+	}
 }
 
 func (g *Game) drawFormula(dst *ebiten.Image, st synth.Status) {
